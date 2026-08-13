@@ -82,6 +82,24 @@ brew install --cask opencode-desktop
 scoop bucket add extras; scoop install extras/opencode-desktop
 ```
 
+#### Differences from upstream `anomalyco/opencode` (this fork)
+
+This fork is based on upstream `dev` and ships one targeted fix that has **not** yet landed upstream
+(see issue [anomalyco/opencode#25664](https://github.com/anomalyco/opencode/issues/25664) and
+PRs [#35241](https://github.com/anomalyco/opencode/pull/35241)/[#35245](https://github.com/anomalyco/opencode/pull/35245)):
+
+- **Windows bash-tool hang when a command spawns a persistent background process.**
+  Upstream completes the spawner's `exitCode` on Node's `close` event, which fires only after **all**
+  stdio streams are closed. A background process started with
+  `Start-Process ... -RedirectStandardOutput/-RedirectStandardError` inherits the stdout/stderr pipe
+  write handles, so `close` never fires and the shell tool hangs until the 2-minute timeout (or the
+  user aborts).
+- **Fix:** complete `exitCode` on the `exit` event instead (the process has exited; whether
+  grandchildren still hold the pipe handles is irrelevant), and drain already-buffered output for a
+  short window before returning so trailing output is not lost.
+
+Everything else is identical to upstream `dev`.
+
 #### Installation Directory
 
 The install script respects the following priority order for the installation path:
