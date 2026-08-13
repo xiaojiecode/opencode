@@ -20,6 +20,7 @@ import { useServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
+import { useIntegrations } from "@/hooks/use-integrations"
 import { CustomProviderForm } from "./dialog-custom-provider"
 import { decode64 } from "@/utils/base64"
 import { createProviderConnectionController, type ProviderConnectMethod } from "./provider-connection-controller"
@@ -138,9 +139,9 @@ export const DialogConnectProvider: Component<{
 
 function ProviderPicker(props: { directory?: string; onSelect: (provider: string) => void; onPrepare?: () => void }) {
   const settings = useSettings()
+  const integrations = useIntegrations(() => props.directory)
   if (settings.general.newLayoutDesigns())
-    return <ProviderPickerV2 directory={props.directory} onSelect={props.onSelect} onPrepare={props.onPrepare} />
-  const providers = useProviders(() => props.directory)
+    return <ProviderPickerV2 integrations={integrations.list} onSelect={props.onSelect} onPrepare={props.onPrepare} />
   const language = useLanguage()
   const popularGroup = () => language.t("dialog.provider.group.popular")
   const otherGroup = () => language.t("dialog.provider.group.other")
@@ -162,7 +163,7 @@ function ProviderPicker(props: { directory?: string; onSelect: (provider: string
       key={(x) => x?.id}
       items={() => {
         language.locale()
-        return [{ id: CUSTOM_ID, name: customLabel() }, ...providers.all().values()]
+        return [{ id: CUSTOM_ID, name: customLabel() }, ...integrations.list()]
       }}
       filterKeys={["id", "name"]}
       groupBy={(x) => (popularProviders.includes(x.id) ? popularGroup() : otherGroup())}
@@ -207,8 +208,11 @@ function ProviderPicker(props: { directory?: string; onSelect: (provider: string
   )
 }
 
-function ProviderPickerV2(props: { directory?: string; onSelect: (provider: string) => void; onPrepare?: () => void }) {
-  const providers = useProviders(() => props.directory)
+function ProviderPickerV2(props: {
+  integrations: ReturnType<typeof useIntegrations>["list"]
+  onSelect: (provider: string) => void
+  onPrepare?: () => void
+}) {
   const language = useLanguage()
   const [store, setStore] = createStore({
     filter: "",
@@ -220,7 +224,7 @@ function ProviderPickerV2(props: { directory?: string; onSelect: (provider: stri
   const all = createMemo(() => {
     language.locale()
     const query = store.filter.trim().toLowerCase()
-    const values = [custom(), ...providers.all().values()]
+    const values = [custom(), ...props.integrations()]
     if (!query) return values
     return values.filter((provider) => `${provider.id} ${provider.name}`.toLowerCase().includes(query))
   })
@@ -369,9 +373,6 @@ function ProviderConnection(props: {
   const providers = useProviders(() => props.directory)
   const directory = () => props.directory ?? decode64(params.dir)
 
-  const provider = createMemo(
-    () => providers.all().get(props.provider) ?? serverSync().data.provider.all.get(props.provider)!,
-  )
   const controller = createProviderConnectionController({
     provider: () => props.provider,
     directory,
@@ -385,6 +386,18 @@ function ProviderConnection(props: {
       })
     },
   })
+  const provider = createMemo(
+    () =>
+      providers.all().get(props.provider) ??
+      serverSync().data.provider.all.get(props.provider) ?? {
+        id: props.provider,
+        name: controller.integration()?.name ?? props.provider,
+        source: "custom" as const,
+        env: [],
+        options: {},
+        models: {},
+      },
+  )
   const methodLabel = (value?: { type?: string; label?: string }) => {
     if (!value) return ""
     if (value.type === "key") return language.t("provider.connect.method.apiKey")

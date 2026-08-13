@@ -1,7 +1,14 @@
 import { Binary } from "@opencode-ai/core/util/binary"
 import { ProjectDirectories } from "@opencode-ai/schema/project-directories"
 import { retry } from "@opencode-ai/core/util/retry"
-import type { OpenCodeEvent, SessionApi, SessionInfo, SessionMessageInfo } from "@opencode-ai/client/promise"
+import type {
+  FormInfo,
+  OpenCodeEvent,
+  SessionApi,
+  SessionInfo,
+  SessionInboxInfo,
+  SessionMessageInfo,
+} from "@opencode-ai/client/promise"
 import type { Message, Part, Todo } from "@/types"
 import type { FileDiffInfo, PermissionRequest, QuestionRequest, SessionStatus } from "@opencode-ai/client/promise"
 import { batch } from "solid-js"
@@ -198,6 +205,9 @@ export function createServerSession(
     todo: {} as Record<string, Todo[]>,
     permission: {} as Record<string, PermissionRequest[]>,
     question: {} as Record<string, QuestionRequest[]>,
+    form: {} as Record<string, FormInfo[]>,
+    pending: {} as Record<string, SessionInboxInfo[]>,
+    input: {} as Record<string, string[]>,
     message: {} as Record<string, Message[]>,
     session_message: {} as Record<string, SessionMessageInfo[]>,
     part: {} as Record<string, Part[]>,
@@ -211,6 +221,7 @@ export function createServerSession(
   const inflightTodo = new Map<string, Promise<void>>()
   const optimistic = new Map<string, Map<string, OptimisticItem>>()
   const v2 = createV2SessionReducer()
+  const transientRevision = new Map<string, number>()
   const messageLoads = new Map<string, MessageLoadState>()
   const pendingParts = new Map<string, Map<string, Set<string>>>()
   const orphanParts = new Map<string, Set<string>>()
@@ -273,6 +284,9 @@ export function createServerSession(
           .filter(([, items]) => items.length > 0)
           .map(([sessionID]) => sessionID),
         ...Object.entries(data.question)
+          .filter(([, items]) => items.length > 0)
+          .map(([sessionID]) => sessionID),
+        ...Object.entries(data.form)
           .filter(([, items]) => items.length > 0)
           .map(([sessionID]) => sessionID),
         ...Object.entries(data.session_status)
@@ -519,6 +533,9 @@ export function createServerSession(
         .filter(([, items]) => items.length > 0)
         .map(([sessionID]) => sessionID),
       ...Object.entries(data.question)
+        .filter(([, items]) => items.length > 0)
+        .map(([sessionID]) => sessionID),
+      ...Object.entries(data.form)
         .filter(([, items]) => items.length > 0)
         .map(([sessionID]) => sessionID),
       ...Object.entries(data.session_status)
@@ -859,7 +876,7 @@ export function createServerSession(
   const projectV2 = (reduction: V2SessionReduction) => {
     reduction.touched.forEach((messageID) => messageLoads.get(reduction.sessionID)?.touchedSource.add(messageID))
     setData("session_message", reduction.sessionID, reconcile(reduction.messages))
-    if (reduction.touched.length === 0) return
+    if (reduction.touched.length === 0 && !reduction.removed?.length) return
 
     const touched = new Set(reduction.touched)
     let parentID: string | undefined
@@ -876,6 +893,9 @@ export function createServerSession(
 
     const normalized = normalizeSessionMessages(reduction.sessionID, reduction.messages)
     batch(() => {
+      for (const messageID of reduction.removed ?? []) {
+        apply({ type: "message.removed", properties: { sessionID: reduction.sessionID, messageID } })
+      }
       for (const message of normalized.messages) {
         if (!touched.has(message.id)) continue
         apply({ type: "message.updated", properties: { sessionID: reduction.sessionID, info: message } })
@@ -910,6 +930,18 @@ export function createServerSession(
   }
 
   const applyV2 = (event: OpenCodeEvent) => {
+    if (event.type === "form.created") {
+      transientRevision.set(event.data.form.sessionID, (transientRevision.get(event.data.form.sessionID) ?? 0) + 1)
+      const current = data.form[event.data.form.sessionID] ?? []
+      if (!current.some((form) => form.id === event.data.form.id))
+        setData("form", event.data.form.sessionID, [...current, event.data.form])
+      return
+    }
+    if (event.type === "form.replied" || event.type === "form.cancelled") {
+      transientRevision.set(event.data.sessionID, (transientRevision.get(event.data.sessionID) ?? 0) + 1)
+      setData("form", event.data.sessionID, (forms) => forms?.filter((form) => form.id !== event.data.id))
+      return
+    }
     if (event.type === "project.directory.resolved") {
       Object.values(data.info).forEach((info) => {
         if (!info) return
@@ -923,6 +955,40 @@ export function createServerSession(
     }
     if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return
     const sessionID = event.data.sessionID
+    if (
+      event.type === "session.inbox.enqueued" ||
+      event.type === "session.inbox.delivery.changed" ||
+      event.type === "session.inbox.cancelled" ||
+      event.type === "session.inbox.delivered" ||
+      event.type === "session.compaction.started" ||
+      event.type === "session.compaction.ended" ||
+      event.type === "session.compaction.failed"
+    )
+      transientRevision.set(sessionID, (transientRevision.get(sessionID) ?? 0) + 1)
+    if (event.type === "session.inbox.enqueued") {
+      const current = data.pending[sessionID] ?? []
+      if (!current.some((item) => item.id === event.data.inboxID))
+        setData("pending", sessionID, [
+          ...current,
+          { id: event.data.inboxID, sessionID, timeCreated: event.created, ...event.data.item },
+        ])
+      if (!data.input[sessionID]?.includes(event.data.inboxID))
+        setData("input", sessionID, [...(data.input[sessionID] ?? []), event.data.inboxID])
+    }
+    if (event.type === "session.inbox.delivery.changed")
+      setData("pending", sessionID, (items) =>
+        items?.map((item) =>
+          item.id === event.data.inboxID ? { ...item, delivery: event.data.delivery } : item,
+        ),
+      )
+    if (event.type === "session.inbox.cancelled" || event.type === "session.inbox.delivered") {
+      setData("pending", sessionID, (items) => items?.filter((item) => item.id !== event.data.inboxID))
+      setData("input", sessionID, (items) => items?.filter((id) => id !== event.data.inboxID))
+    }
+    if (event.type === "session.compaction.started" || event.type === "session.compaction.failed")
+      setData("pending", sessionID, (items) => items?.filter((item) => item.id !== event.data.inputID))
+    if (event.type === "session.compaction.ended")
+      setData("pending", sessionID, (items) => items?.filter((item) => item.type !== "compaction"))
     const reduction = v2.reduce(data.session_message[sessionID] ?? [], event)
     if (reduction) {
       projectV2(reduction)
@@ -930,6 +996,11 @@ export function createServerSession(
     }
 
     const info = data.info[sessionID]
+    if (event.type === "session.agent.selected" && info) remember({ ...info, agent: event.data.agent })
+    if (event.type === "session.model.selected") {
+      if (info) remember({ ...info, model: event.data.model })
+      if (data.session_message[sessionID]) hydrateV2Message(sessionID, event.id.replace(/^evt_/, "msg_"))
+    }
     if (event.type === "session.renamed" && info)
       remember({ ...info, title: event.data.title, time: { ...info.time, updated: event.created } })
     if (event.type === "session.moved" && info)
@@ -967,6 +1038,7 @@ export function createServerSession(
       event.type === "session.revert.committed"
     )
       void resolve(sessionID, { force: true }).catch(() => {})
+    if (event.type === "session.revert.committed") void sync(sessionID, { force: true }).catch(() => {})
   }
 
   const apply = (event: { type: string; properties?: unknown }) => {
@@ -1295,6 +1367,27 @@ export function createServerSession(
       },
     },
     sync,
+    async hydrateTransient(
+      sessionID: string,
+      load: () => Promise<{ pending: SessionInboxInfo[]; forms: FormInfo[] }>,
+    ) {
+      const revision = transientRevision.get(sessionID) ?? 0
+      const result = await load()
+      if ((transientRevision.get(sessionID) ?? 0) !== revision) return
+      setData("pending", sessionID, reconcile(result.pending))
+      setData(
+        "input",
+        sessionID,
+        reconcile(result.pending.filter((item) => item.type !== "compaction").map((item) => item.id)),
+      )
+      setData("form", sessionID, reconcile(result.forms))
+    },
+    refreshPinned() {
+      return Promise.all([...pinned.keys()].map((sessionID) => sync(sessionID, { force: true }))).then(() => undefined)
+    },
+    invalidate() {
+      setMeta("at", {})
+    },
     prefetch,
     shouldPrefetch(sessionID: string, limit: number) {
       if (data.message[sessionID] === undefined) return true

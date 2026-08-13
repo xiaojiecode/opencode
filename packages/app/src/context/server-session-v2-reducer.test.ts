@@ -211,6 +211,29 @@ describe("v2 session reducer", () => {
     expect(result).toMatchObject({ sessionID: "ses_1", missing: "msg_user", touched: [] })
   })
 
+  test("projects non-initial instruction updates", () => {
+    const reducer = createV2SessionReducer()
+    const result = reducer.reduce(
+      [],
+      event({
+        ...base,
+        id: "evt_instructions",
+        type: "session.instructions.updated",
+        data: { sessionID: "ses_1", delta: { agents: "hash" } },
+      }),
+    )
+
+    expect(result?.messages).toEqual([
+      {
+        id: "msg_instructions",
+        type: "system",
+        text: "Instructions updated: agents",
+        metadata: undefined,
+        time: { created: 1 },
+      },
+    ])
+  })
+
   test("removes cancelled input from the pending promotion fold", () => {
     const reducer = createV2SessionReducer()
     reducer.reduce(

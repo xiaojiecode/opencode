@@ -348,6 +348,72 @@ describe("server session", () => {
     expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "world" }])
   })
 
+  test("projects V2 pending inputs and forms", () => {
+    const ctx = setup({ child: session("child") })
+    const apply = (input: object) => ctx.store.applyV2(input as OpenCodeEvent)
+
+    apply({
+      id: "evt_admitted",
+      created: 1,
+      type: "session.inbox.enqueued",
+      data: {
+        sessionID: "child",
+        inboxID: "msg_input",
+        item: { type: "user", delivery: "steer", payload: { text: "hello" } },
+      },
+    })
+    apply({
+      id: "evt_form",
+      created: 2,
+      type: "form.created",
+      data: { form: { id: "frm_1", sessionID: "child", title: "Choose", fields: [] } },
+    })
+
+    expect(ctx.store.data.pending.child).toMatchObject([{ id: "msg_input", delivery: "steer" }])
+    expect(ctx.store.data.input.child).toEqual(["msg_input"])
+    expect(ctx.store.data.form.child).toMatchObject([{ id: "frm_1", title: "Choose" }])
+    expect(ctx.store.data.message.child).toMatchObject([{ id: "msg_input" }])
+
+    apply({
+      id: "evt_cancelled",
+      created: 3,
+      type: "session.inbox.cancelled",
+      data: { sessionID: "child", inboxID: "msg_input" },
+    })
+    apply({
+      id: "evt_form_done",
+      created: 4,
+      type: "form.cancelled",
+      data: { sessionID: "child", id: "frm_1" },
+    })
+
+    expect(ctx.store.data.pending.child).toEqual([])
+    expect(ctx.store.data.input.child).toEqual([])
+    expect(ctx.store.data.form.child).toEqual([])
+    expect(ctx.store.data.message.child).toEqual([])
+  })
+
+  test("does not let transient hydration overwrite newer events", async () => {
+    const ctx = setup({ child: session("child") })
+    const response = Promise.withResolvers<{ pending: []; forms: [] }>()
+    const hydration = ctx.store.hydrateTransient("child", () => response.promise)
+
+    ctx.store.applyV2({
+      id: "evt_admitted",
+      created: 1,
+      type: "session.inbox.enqueued",
+      data: {
+        sessionID: "child",
+        inboxID: "msg_input",
+        item: { type: "user", delivery: "queue", payload: { text: "new" } },
+      },
+    } as OpenCodeEvent)
+    response.resolve({ pending: [], forms: [] })
+    await hydration
+
+    expect(ctx.store.data.pending.child).toMatchObject([{ id: "msg_input" }])
+  })
+
   test("resolves lineage by session ID without directory", async () => {
     const ctx = setup({ child: session("child", "root"), root: session("root") })
 

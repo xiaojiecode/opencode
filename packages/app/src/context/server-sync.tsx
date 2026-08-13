@@ -1,7 +1,7 @@
 import type { Config, Path, Project, ProviderAuthResponse } from "@/types"
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
-import { batch, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
+import { type Accessor, batch, createMemo, getOwner, onCleanup, untrack } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import type { InitError } from "../pages/error"
@@ -13,6 +13,7 @@ import {
   loadAgentsQuery,
   loadCommands,
   loadGlobalConfigQuery,
+  loadIntegrationsQuery,
   loadPathQuery,
   loadProjectsQuery,
   loadProvidersQuery,
@@ -29,7 +30,7 @@ import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from 
 import type { SolidQueryOptions } from "@tanstack/solid-query"
 import { createRefreshQueue } from "./global-sync/queue"
 import { directoryKey } from "./global-sync/utils"
-import { PathKey } from "@/utils/path-key"
+import { pathKey, PathKey } from "@/utils/path-key"
 import { createDirSyncContext } from "./directory-sync"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
@@ -53,6 +54,9 @@ import type {
 } from "@opencode-ai/client/promise"
 import { toggleMcp } from "./global-sync/mcp"
 import { createServerSession, type ServerSession } from "./server-session"
+import { createCatalogSync } from "./server-sync/catalog"
+import { createConnectionSync } from "./server-sync/connection"
+import { createLocationSync } from "./server-sync/location"
 import { usePlatform } from "./platform"
 
 export function captureSessionMove(
@@ -181,11 +185,24 @@ export function seedActiveSessionStatuses(
   }
 }
 
+export function reconcileActiveSessionStatuses(
+  session: Pick<ServerSession, "data" | "set">,
+  active: SessionActiveOutput,
+) {
+  for (const sessionID of Object.keys(session.data.session_status)) {
+    if (active[sessionID] !== undefined) continue
+    if (session.data.session_status[sessionID]?.type !== "idle")
+      session.set("session_status", sessionID, { type: "idle" })
+  }
+  for (const sessionID of Object.keys(active)) session.set("session_status", sessionID, { type: "busy" })
+}
+
 function makeQueryOptionsApi(scope: ServerScope, serverAPI: ServerApi) {
   return {
     globalConfig: () => loadGlobalConfigQuery(scope),
     projects: () => loadProjectsQuery(scope, serverAPI.project),
     providers: (directory: PathKey | null) => loadProvidersQuery(scope, directory, serverAPI),
+    integrations: (directory: PathKey | null) => loadIntegrationsQuery(scope, directory, serverAPI.integration),
     path: (directory: PathKey | null) => loadPathQuery(scope, directory, serverAPI.location),
     agents: (directory: PathKey) => loadAgentsQuery(scope, directory, serverAPI.agent),
     references: (directory: PathKey) => loadReferencesQuery(scope, directory, serverAPI.reference),
@@ -209,26 +226,41 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const session = createServerSession(serverSDK.api.session, serverSDK.api.message)
   const queryOptionsApi = makeQueryOptionsApi(serverSDK.scope, serverSDK.api)
+  const connected = () => serverSDK.connection.status() === "connected"
+  const hydrateSessionState = async (sessionID: string) => {
+    await session.hydrateTransient(sessionID, async () => {
+      const [pending, forms] = await Promise.all([
+        serverSDK.api.session.inbox.list({ sessionID }),
+        serverSDK.api.form.list({ sessionID }),
+      ])
+      return { pending, forms }
+    })
+  }
 
   const [configQuery, providerQuery, pathQuery] = useQueries(() => ({
-    queries: [queryOptionsApi.globalConfig(), queryOptionsApi.providers(null), queryOptionsApi.path(null)],
+    queries: [
+      { ...queryOptionsApi.globalConfig(), enabled: connected() },
+      { ...queryOptionsApi.providers(null), enabled: connected() },
+      { ...queryOptionsApi.path(null), enabled: connected() },
+    ],
   }))
-  const activeSessionsQuery = useQuery(() =>
-    loadActiveSessionsQuery(serverSDK.scope, {
+  const activeSessionsQuery = useQuery(() => ({
+    ...loadActiveSessionsQuery(serverSDK.scope, {
       active: async () => {
         const active = await serverSDK.api.session.active()
-        seedActiveSessionStatuses(session, active)
+        reconcileActiveSessionStatuses(session, active)
         for (const sessionID of Object.keys(active)) {
-          void session.resolve(sessionID).catch(() => undefined)
+          void Promise.all([session.resolve(sessionID), hydrateSessionState(sessionID)]).catch(() => undefined)
         }
         return active
       },
     }),
-  )
+    enabled: connected(),
+  }))
 
   const [globalStore, setGlobalStore] = createStore<GlobalStore>({
     get ready() {
-      return !bootstrap.isPending
+      return bootstrap.isSuccess
     },
     project: [],
     provider_auth: {},
@@ -253,21 +285,6 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const queryClient = useQueryClient()
   const homeSessions = createHomeSessionIndexCache(queryClient, ServerConnection.key(serverSDK.server))
-  const refreshProviders = () =>
-    queryClient.refetchQueries({
-      predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "providers",
-    })
-
-  let bootedAt = 0
-  let bootingRoot = false
-  let eventFrame: number | undefined
-  let eventTimer: ReturnType<typeof setTimeout> | undefined
-
-  onCleanup(() => {
-    if (eventFrame !== undefined) cancelAnimationFrame(eventFrame)
-    if (eventTimer !== undefined) clearTimeout(eventTimer)
-  })
-
   const setProjects = (next: Project[] | ((draft: Project[]) => Project[])) => {
     setGlobalStore("project", next)
   }
@@ -292,9 +309,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         setGlobalStore: setBootStore,
         queryClient,
       })
-      bootedAt = Date.now()
-      return bootedAt
+      return Date.now()
     },
+    enabled: connected(),
   }))
 
   const set = ((...input: unknown[]) => {
@@ -316,11 +333,13 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const children = createChildStoreManager({
     owner,
+    connected,
     scope: serverSDK.scope,
     persist: persisted,
     isBooting: (directory) => booting.has(directory),
     isLoadingSessions: (directory) => sessionLoads.has(directory),
     onBootstrap: (directory) => {
+      if (!connected()) return
       void bootstrapInstance(directory)
     },
     onMcp: (directory, setStore) => {
@@ -343,8 +362,43 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     translate: language.t,
     queryOptions: queryOptionsApi,
     global: {
-      provider: globalStore.provider,
+      get provider() {
+        return globalStore.provider
+      },
     },
+  })
+  const catalog = createCatalogSync({
+    scope: serverSDK.scope,
+    queryClient,
+    active: () => Object.keys(children.children).filter(children.active).map(pathKey),
+    load: (directory) =>
+      Promise.all([
+        queryClient.fetchQuery(queryOptionsApi.providers(directory)),
+        queryClient.fetchQuery(queryOptionsApi.integrations(directory)),
+      ]).then(() => undefined),
+  })
+  const connection = createConnectionSync({
+    status: serverSDK.connection.status,
+    invalidate: session.invalidate,
+    connected: (info) => {
+      if (info.reconnect) void session.refreshPinned()
+      if (activeSessionsQuery.data !== undefined && !activeSessionsQuery.isFetching) void activeSessionsQuery.refetch()
+      if (bootstrap.data !== undefined && !bootstrap.isFetching) void bootstrap.refetch()
+      for (const directory of Object.keys(children.children)) {
+        if (children.active(directory)) queue.push(directory)
+      }
+    },
+  })
+  const location = createLocationSync({
+    scope: serverSDK.scope,
+    queryClient,
+    active: () => Object.keys(children.children).filter(children.active).map(pathKey),
+    info: (directory) => serverSDK.api.location.get({ location: { directory } }),
+    vcs: (directory) => serverSDK.api.vcs.get({ location: { directory } }).then((result) => result.data),
+    skill: (directory) => serverSDK.api.skill.list({ location: { directory } }).then((result) => result.data),
+    websearch: (directory) =>
+      serverSDK.api.websearch.providers({ location: { directory } }).then((result) => result.data),
+    shell: (directory) => serverSDK.api.shell.list({ location: { directory } }).then((result) => result.data),
   })
 
   async function loadSessions(directory: string, options?: { limit?: number }) {
@@ -513,9 +567,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const key = directoryKey(directory)
     const event = e.details
     const eventType: string = event.type
-    const recent = bootingRoot || Date.now() - bootedAt < 1500
     const moved = captureSessionMove(event, session.get)
-
     if (event.current) session.applyV2(event.current)
     session.apply(event)
     if (moved) reindexSession(moved.sessionID, moved.from)
@@ -545,35 +597,38 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     if (event.type === "session.created" || event.type === "session.deleted") {
       if ("info" in event.properties) homeSessions.apply(event as Parameters<typeof homeSessions.apply>[0])
     }
+    if (
+      event.current?.type === "session.renamed" ||
+      event.current?.type === "session.moved" ||
+      event.current?.type === "session.usage.updated"
+    ) {
+      const info = session.get(event.current.data.sessionID)
+      if (info)
+        homeSessions.apply({
+          type: "session.updated",
+          properties: { sessionID: info.id, info },
+        })
+    }
     homeSessions.refresh(event.type)
-    if (eventType === "integration.connection.updated") void refreshProviders()
+    catalog.main({ type: eventType, directory })
+    connection.main({ type: eventType, directory })
+    if (event.current) location.main(event.current, directory)
 
     if (directory === "global") {
-      if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
-        void activeSessionsQuery.refetch()
       applyGlobalEvent({
         event,
         project: globalStore.project,
-        refresh: () => {
-          if (recent) return
-          bootstrap.refetch()
-        },
+        refresh: () => void bootstrap.refetch(),
         setGlobalProject: setProjects,
       })
       if (
         eventType === "config.updated" ||
-        eventType === "catalog.updated" ||
         eventType === "agent.updated" ||
         eventType === "project.directories.updated"
       )
         bootstrap.refetch()
-      if (eventType === "server.connected" || eventType === "global.disposed") {
-        if (recent) return
-        for (const directory of Object.keys(children.children)) {
-          if (!children.active(directory)) continue
-          queue.push(directory)
-        }
-      }
+      if (eventType === "global.disposed")
+        for (const directory of Object.keys(children.children)) if (children.active(directory)) queue.push(directory)
       return
     }
 
@@ -590,7 +645,6 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       event.current?.type === "session.moved" ||
       // event.current?.type === "session.archived" ||
       event.current?.type === "session.forked" ||
-      eventType === "command.updated" ||
       eventType === "config.updated" ||
       eventType === "agent.updated"
     )
@@ -598,6 +652,16 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     if (eventType === "mcp.status.changed") void queryClient.invalidateQueries(queryOptionsApi.mcp(key))
     if (eventType === "mcp.resources.changed") void queryClient.invalidateQueries(queryOptionsApi.mcpResources(key))
     const [store, setStore] = existing
+    if (eventType === "agent.updated")
+      void queryClient
+        .fetchQuery(queryOptionsApi.agents(key))
+        .then((data) => setStore("agent", data))
+        .catch(() => {})
+    if (eventType === "command.updated")
+      void loadCommands(directory, serverSDK.api.command)
+        .then((commands) => setStore("command", commands))
+        .catch(() => {})
+    if (eventType === "project.directories.updated") void bootstrap.refetch()
     applyDirectoryEvent({
       event,
       directory,
@@ -628,23 +692,6 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   onCleanup(() => {
     for (const directory of Object.keys(children.children)) {
       children.disposeDirectory(directoryKey(directory))
-    }
-  })
-
-  onMount(() => {
-    if (typeof requestAnimationFrame === "function") {
-      eventFrame = requestAnimationFrame(() => {
-        eventFrame = undefined
-        eventTimer = setTimeout(() => {
-          eventTimer = undefined
-          void serverSDK.event.start()
-        }, 0)
-      })
-    } else {
-      eventTimer = setTimeout(() => {
-        eventTimer = undefined
-        void serverSDK.event.start()
-      }, 0)
     }
   })
 
@@ -688,7 +735,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     peek: children.peek,
     disableMcp: children.disableMcp,
     queryOptions: queryOptionsApi,
-    refreshProviders,
+    refreshProviders: catalog.refreshActive,
     // bootstrap,
     updateConfig: updateConfigMutation.mutateAsync,
     project: projectApi,

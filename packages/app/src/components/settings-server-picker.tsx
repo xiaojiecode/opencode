@@ -1,10 +1,20 @@
-import { QueryClientProvider } from "@tanstack/solid-query"
+import { QueryClient, QueryClientProvider } from "@tanstack/solid-query"
 import { type ParentProps, Show } from "solid-js"
 import { useGlobal } from "@/context/global"
 import { ModelsProvider } from "@/context/models"
 import { ServerConnection } from "@/context/server"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider } from "@/context/server-sync"
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnReconnect: false,
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+    },
+  },
+})
 
 export function SettingsServerScope(props: ParentProps) {
   const global = useGlobal()
@@ -16,10 +26,8 @@ export function SettingsServerScope(props: ParentProps) {
 }
 
 export function SettingsServerDataScope(props: ParentProps<{ server: ServerConnection.Any }>) {
-  const global = useGlobal()
-  const serverCtx = () => global.ensureServerCtx(props.server)
   return (
-    <QueryClientProvider client={serverCtx().queryClient}>
+    <QueryClientProvider client={queryClient}>
       <ServerSDKProvider server={props.server}>
         <ServerSyncProvider server={props.server}>
           <ModelsProvider>{props.children}</ModelsProvider>

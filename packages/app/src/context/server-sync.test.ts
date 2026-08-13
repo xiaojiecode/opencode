@@ -15,6 +15,7 @@ import {
   loadActiveSessionsQuery,
   loadMcpQuery,
   loadMcpResourcesQuery,
+  reconcileActiveSessionStatuses,
   seedActiveSessionStatuses,
 } from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
@@ -106,6 +107,17 @@ describe("active session query", () => {
       message: "retrying",
       next: 10,
     })
+  })
+
+  test("replaces stale active statuses after reconnect", () => {
+    const session = createServerSession({} as ServerApi["session"], {} as ServerApi["message"])
+    session.set("session_status", "ses_stale", { type: "busy" })
+    session.set("session_status", "ses_active", { type: "idle" })
+
+    reconcileActiveSessionStatuses(session, { ses_active: { type: "running" } })
+
+    expect(session.data.session_status.ses_stale).toEqual({ type: "idle" })
+    expect(session.data.session_status.ses_active).toEqual({ type: "busy" })
   })
 })
 
