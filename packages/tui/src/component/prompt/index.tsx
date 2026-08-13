@@ -5,7 +5,6 @@ import {
   MouseEvent,
   PasteEvent,
   decodePasteBytes,
-  getTreeSitterClient,
   type KeyEvent,
   type Renderable,
 } from "@opentui/core"
@@ -233,9 +232,6 @@ export function Prompt(props: PromptProps) {
   const agentStyleId = syntax().getStyleId("extmark.agent")!
   const pasteStyleId = syntax().getStyleId("extmark.paste")!
   let promptPartTypeId = 0
-  let syntaxHighlightTypeId = 0
-  let syntaxHighlightVersion = 0
-  const syntaxHighlightIds = new Set<number>()
   const event = useEvent()
 
   event.on("tui.prompt.append", (evt, { workspace }) => {
@@ -300,45 +296,6 @@ export function Prompt(props: PromptProps) {
     mode: "normal",
     extmarkToPartIndex: new Map(),
     interrupt: 0,
-  })
-
-  createEffect(() => {
-    const mode = store.mode
-    const content = store.prompt.input
-    const style = syntax()
-    const version = ++syntaxHighlightVersion
-
-    if (input && !input.isDestroyed) {
-      syntaxHighlightIds.forEach((id) => input.extmarks.delete(id))
-      syntaxHighlightIds.clear()
-    }
-    if (mode !== "shell" || !content || !input || input.isDestroyed) return
-
-    const timeout = setTimeout(() => {
-      getTreeSitterClient()
-        .highlightOnce(content, "bash")
-        .then((result) => {
-          if (version !== syntaxHighlightVersion || !result.highlights || !input || input.isDestroyed) return
-
-          const bytes = new TextEncoder().encode(content)
-          const decoder = new TextDecoder()
-          result.highlights.forEach(([start, end, group]) => {
-            const styleId = style.getStyleId(group)
-            if (styleId === null) return
-            syntaxHighlightIds.add(
-              input.extmarks.create({
-                start: promptOffsetWidth(decoder.decode(bytes.subarray(0, start))),
-                end: promptOffsetWidth(decoder.decode(bytes.subarray(0, end))),
-                styleId,
-                typeId: syntaxHighlightTypeId,
-              }),
-            )
-          })
-          renderer.requestRender()
-        })
-        .catch(() => {})
-    }, 50)
-    onCleanup(() => clearTimeout(timeout))
   })
 
   createEffect(
@@ -731,7 +688,6 @@ export function Prompt(props: PromptProps) {
           end,
           virtual: true,
           styleId,
-          priority: 1,
           typeId: promptPartTypeId,
         })
         setStore("extmarkToPartIndex", (map: Map<number, number>) => {
@@ -1202,7 +1158,6 @@ export function Prompt(props: PromptProps) {
       end: extmarkEnd,
       virtual: true,
       styleId: pasteStyleId,
-      priority: 1,
       typeId: promptPartTypeId,
     })
 
@@ -1286,7 +1241,6 @@ export function Prompt(props: PromptProps) {
       end: extmarkEnd,
       virtual: true,
       styleId: pasteStyleId,
-      priority: 1,
       typeId: promptPartTypeId,
     })
 
@@ -1472,9 +1426,6 @@ export function Prompt(props: PromptProps) {
                 setInputTarget(r)
                 if (promptPartTypeId === 0) {
                   promptPartTypeId = input.extmarks.registerType("prompt-part")
-                }
-                if (syntaxHighlightTypeId === 0) {
-                  syntaxHighlightTypeId = input.extmarks.registerType("syntax-highlight")
                 }
                 props.ref?.(ref)
                 setTimeout(() => {

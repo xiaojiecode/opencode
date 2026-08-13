@@ -1851,6 +1851,7 @@ function InlineTool(props: {
   spinner?: boolean
   separate?: boolean
   children: JSX.Element
+  content?: JSX.Element
   part: ToolPart
   onClick?: () => void
 }) {
@@ -1903,6 +1904,7 @@ function InlineTool(props: {
       failure={props.failure}
       spinner={props.spinner}
       separate={props.separate}
+      content={props.content}
       onMouseOver={() => clickable() && setHover(true)}
       onMouseOut={() => setHover(false)}
       onMouseUp={() => {
@@ -1934,6 +1936,7 @@ export function InlineToolRow(props: {
   spinner?: boolean
   separate?: boolean
   children: JSX.Element
+  content?: JSX.Element
   onMouseOver?: () => void
   onMouseOut?: () => void
   onMouseUp?: () => void
@@ -1979,13 +1982,20 @@ export function InlineToolRow(props: {
               >
                 {props.icon}
               </text>
-              <text
-                flexGrow={1}
-                fg={props.failed ? props.errorColor : props.color}
-                attributes={props.denied ? TextAttributes.STRIKETHROUGH : undefined}
+              <Show
+                when={props.content}
+                fallback={
+                  <text
+                    flexGrow={1}
+                    fg={props.failed ? props.errorColor : props.color}
+                    attributes={props.denied ? TextAttributes.STRIKETHROUGH : undefined}
+                  >
+                    {props.failed && !props.complete ? (props.failure ?? props.children) : props.children}
+                  </text>
+                }
               >
-                {props.failed && !props.complete ? (props.failure ?? props.children) : props.children}
-              </text>
+                {props.content}
+              </Show>
             </box>
           </Show>
         </Match>
@@ -2052,7 +2062,7 @@ function BlockTool(props: {
 }
 
 function Shell(props: ToolProps) {
-  const { theme } = useTheme()
+  const { theme, syntax } = useTheme()
   const pathFormatter = usePathFormatter()
   const ctx = use()
   const isRunning = createMemo(() => props.part.state.status === "running")
@@ -2089,7 +2099,21 @@ function Shell(props: ToolProps) {
           onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
         >
           <box gap={1}>
-            <Show when={isRunning()} fallback={<text fg={theme.text}>$ {stringValue(props.input.command)}</text>}>
+            <Show
+              when={isRunning()}
+              fallback={
+                <box flexDirection="row">
+                  <text fg={theme.text}>$ </text>
+                  <code
+                    content={stringValue(props.input.command)}
+                    filetype="bash"
+                    syntaxStyle={syntax()}
+                    conceal={false}
+                    fg={theme.text}
+                  />
+                </box>
+              }
+            >
               <Spinner color={theme.text}>{stringValue(props.input.command)}</Spinner>
             </Show>
             <Show when={output()}>
@@ -2102,7 +2126,21 @@ function Shell(props: ToolProps) {
         </BlockTool>
       </Match>
       <Match when={true}>
-        <InlineTool icon="$" pending="Writing command..." complete={stringValue(props.input.command)} part={props.part}>
+        <InlineTool
+          icon="$"
+          pending="Writing command..."
+          complete={stringValue(props.input.command)}
+          part={props.part}
+          content={
+            <code
+              content={stringValue(props.input.command)}
+              filetype="bash"
+              syntaxStyle={syntax()}
+              conceal={false}
+              fg={theme.textMuted}
+            />
+          }
+        >
           {stringValue(props.input.command)}
         </InlineTool>
       </Match>
